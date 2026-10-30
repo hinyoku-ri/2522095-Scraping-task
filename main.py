@@ -1,120 +1,110 @@
+"""武蔵野大学Webサイトのサイトマップ抽出
+
+トップページから同じドメインのリンクをたどり、
+全ページの URL と <title> を辞書に保存して CSV に書き出す。
+"""
+import csv
+import time
+from urllib.parse import urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import time
-import csv
 
-# 武蔵野大学のホームページ
-url = "https://www.musashino-u.ac.jp/"
+# 武蔵野大学のトップページ
+START_URL = "https://www.musashino-u.ac.jp/"
 
-# 調べるURLを保存するリスト
-url_list = [url]
+# サーバーへの負荷を減らすための待ち時間（秒）
+SLEEP_SEC = 1
 
-# 調べたURLを保存するリスト
-visited = []
+# 保存するCSVファイル名
+CSV_NAME = "sitemap_titles.csv"
 
-# URLとタイトルを保存する辞書
+# HTMLではないファイル（ダウンロードしても意味がないもの）
+SKIP_EXT = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".zip",
+            ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".mp3", ".mp4")
+
+# 同じドメインかどうか確認するために使う
+domain = urlparse(START_URL).netloc
+
+# key: URL, value: <title></title>で挟まれた文字列
 data = {}
 
-# 同じドメインか確認する
-domain = urlparse(url).netloc
+
+def clean_url(url):
+    """URLを整える（#以降を削除し、httpをhttpsに統一する）"""
+    url = url.split("#")[0]
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url
 
 
-# CSVファイルに保存する
+def is_target(url):
+    """たどるべきURLか判定する"""
+    parsed = urlparse(url)
+    if parsed.scheme != "https":      # mailto: や tel: などを除く
+        return False
+    if parsed.netloc != domain:       # 同一ドメインのみ
+        return False
+    if parsed.path.lower().endswith(SKIP_EXT):
+        return False
+    return True
+
+
 def save_csv():
-    with open("sitemap_titles.csv", "w", newline="", encoding="utf-8-sig") as f:
+    """辞書の内容をCSVに保存する"""
+    # utf-8-sig にするとExcelで開いても文字化けしない
+    with open(CSV_NAME, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-
         writer.writerow(["URL", "Title"])
-
         for page_url, title in data.items():
             writer.writerow([page_url, title])
 
 
-# Webサイトを巡回する
-try:
-    while len(url_list) > 0:
+def main():
+    to_visit = [clean_url(START_URL)]   # これから調べるURL
+    seen = set(to_visit)                # 一度でも予定に入れたURL（重複防止）
 
-        # リストからURLを取り出す
-        current_url = url_list.pop(0)
+    try:
+        while to_visit:
+            current_url = to_visit.pop(0)
 
-        # すでに調べたURLは飛ばす
-        if current_url in visited:
-            continue
+            time.sleep(SLEEP_SEC)       # アクセスの前に必ず待つ
+            try:
+                response = requests.get(current_url, timeout=10)
+                response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                print("アクセスエラー:", current_url, e)
+                continue
 
-        visited.append(current_url)
-
-        try:
-            # サーバーへの負担を減らす
-            time.sleep(1)
-
-            # Webページにアクセスする
-            response = requests.get(current_url, timeout=10)
-            response.raise_for_status()
-
-            # HTML以外のファイルは飛ばす
-            content_type = response.headers.get("Content-Type", "")
-
-            if "text/html" not in content_type.lower():
+            # HTML以外は飛ばす
+            if "text/html" not in response.headers.get("Content-Type", "").lower():
                 continue
 
             response.encoding = response.apparent_encoding
-
-            # HTMLを解析する
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # titleタグを取得する
-            if soup.title:
-                title = soup.title.get_text(strip=True)
-            else:
-                title = ""
-
-            # URLとタイトルを辞書に保存する
+            # <title>を取得して辞書に保存
+            title = soup.title.get_text(strip=True) if soup.title else ""
             data[current_url] = title
+            print(f"[{len(data)}] {current_url} : {title}")
 
-            print("URL:", current_url)
-            print("Title:", title)
-            print("--------------------")
+            # ページ内のリンクを集める
+            for a in soup.find_all("a", href=True):
+                new_url = clean_url(urljoin(current_url, a["href"]))
+                if is_target(new_url) and new_url not in seen:
+                    seen.add(new_url)
+                    to_visit.append(new_url)
 
-            # ページ内のリンクを取得する
-            links = soup.find_all("a", href=True)
+            # 100ページごとに途中保存（止まってもデータが残るように）
+            if len(data) % 100 == 0:
+                save_csv()
 
-            for link in links:
+    except KeyboardInterrupt:
+        print("\nCtrl+Cで中断しました。ここまでの結果を保存します。")
 
-                # 相対URLを絶対URLに変換する
-                new_url = urljoin(current_url, link["href"])
-
-                # #以降を取り除く
-                new_url = new_url.split("#")[0]
-
-                # 同じドメインのリンクだけを追加する
-                if urlparse(new_url).netloc == domain:
-
-                    # httpとhttpsのURLだけを対象にする
-                    if urlparse(new_url).scheme in ["http", "https"]:
-
-                        # 重複していないURLを追加する
-                        if new_url not in visited and new_url not in url_list:
-                            url_list.append(new_url)
-
-        except requests.exceptions.RequestException as e:
-            print("アクセスエラー:", current_url)
-            print(e)
-
-        # 50ページごとにCSVを保存する
-        if len(visited) % 50 == 0:
-            save_csv()
-            print("途中保存しました:", len(data))
-
-# Ctrl + Cで停止した場合
-except KeyboardInterrupt:
-    print("\nプログラムを停止しました。")
+    save_csv()
+    print(f"完了: {len(data)} ページを {CSV_NAME} に保存しました")
 
 
-# 最後にCSVファイルを保存する
-save_csv()
-
-print("\n--- 完了 ---")
-print("確認したURL数:", len(visited))
-print("保存したページ数:", len(data))
-print("CSVファイル: sitemap_titles.csv")
+if __name__ == "__main__":
+    main()
